@@ -52,10 +52,21 @@ func TestDiscovery(test *testing.T) {
 			test.Log(err)
 			test.FailNow()
 		}
+
+		<-time.After(time.Second / 2)
+		_, err = conn.Write([]byte("testing,thing@127.0.0.2"))
+		if err != nil {
+			test.Log(err)
+			test.FailNow()
+		}
 	}()
+
+	discover.Add("test", "what")
 
 	go discover.Loop(time.Second)
 	<-time.After(time.Second * 5)
+	discover.Remove("test")
+	discover.Unhandle("thing")
 	discover.Close()
 }
 

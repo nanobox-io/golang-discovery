@@ -14,6 +14,12 @@ Lets say that you want to automatically keep a list of all services of a type th
 import (
   "github.com/nanbox-io/golang-discovery"
   "time"
+  "io"
+  "fmt"
+)
+
+type (
+  generator struct {}
 )
 
 func main() {
@@ -23,7 +29,7 @@ func main() {
   }
 
   discover.Add("service name", "value")
-  discover.Handle("service name", generator)
+  discover.Handle("service name", generator{})
 
   err := discover.Loop()
   if err != nil {
@@ -31,5 +37,10 @@ func main() {
   }
 }
 
+
+func (g generator) New(address) io.Closer {
+  fmt.Println("creating a new client for", address)
+  return io.NoopCloser(nil)
+}
 
 ```
