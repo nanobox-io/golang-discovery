@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
 	"time"
 )
 
@@ -22,18 +21,19 @@ const (
 
 type (
 	Generator interface {
-		New() io.Closer
+		New(string) io.Closer
 	}
 
 	Discover interface {
-		Loop() error
+		Loop(time.Duration) error
 		Close() error
-		Add(string, string, Generator)
+		Add(string, string)
 		Remove(string)
+		Handle(string, Generator)
+		Unhandle(string)
 	}
 
-	pong chan bool
-	ping chan ping
+	ping chan bool
 
 	idip struct {
 		id string
@@ -48,50 +48,61 @@ type (
 	discoverer struct {
 		conn      *net.UDPConn
 		done      chan interface{}
-		broadcast map[string]generator
+		broadcast map[string]string
+		handle    map[string]Generator
 		alive     map[string]ping
 		aliveMsg  chan idip
 		timeout   time.Duration
-		token     string
+		token     []byte
 		address   *net.UDPAddr
 	}
 )
 
-func NewDiscovery(port int, network, token string, timeout time.Duration) (Discover, error) {
+func NewDiscovery(network, token string, timeout time.Duration) (Discover, error) {
 	discover := &discoverer{
 		done:      make(chan interface{}),
-		aliveMsg:  make(chan string),
+		aliveMsg:  make(chan idip),
 		broadcast: map[string]string{},
+		handle:    map[string]Generator{},
 		alive:     map[string]ping{},
-		generator: gen,
 		timeout:   timeout,
-		token:     "token",
+		token:     []byte(token),
 	}
 	var err error
 
-	d.address = &net.UDPAddr{
+	discover.address = &net.UDPAddr{
 		IP:   net.ParseIP(address),
-		Port: port,
+		Port: 5432,
 	}
 
-	discover.conn, err = net.ListenMulticastUDP("udp4", network, d.address)
+	iface, err := net.InterfaceByName(network)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	discover.conn, err = net.ListenMulticastUDP("udp4", iface, discover.address)
+	if err != nil {
+		return nil, err
 	}
 
-	return discoverer
+	return discover, nil
 }
 
-func (d *discoverer) Add(key, value string, gen Generator) {
+func (d *discoverer) Add(key, value string) {
 	// really should validate the ip address (value)....
-	d.broadcast[key] = generator{
-		value:     value,
-		generator: gen,
-	}
+	d.broadcast[key] = value
 }
 
 func (d *discoverer) Remove(key string) {
 	delete(d.broadcast, key)
+}
+
+func (d *discoverer) Handle(key string, gen Generator) {
+	d.handle[key] = gen
+}
+
+func (d *discoverer) Unhandle(key string) {
+	// I should really close already created handlers
+	delete(d.handle, key)
 }
 
 func (d *discoverer) Close() error {
@@ -105,7 +116,7 @@ func (d *discoverer) Loop(every time.Duration) error {
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 
-	go d.receiveBroadcasts()
+	go d.receiveBroadcasts(d.conn)
 	for {
 		select {
 		case <-ticker.C:
@@ -113,48 +124,52 @@ func (d *discoverer) Loop(every time.Duration) error {
 				return err
 			}
 		case <-d.done:
-			return
+			return nil
 		case msg := <-d.aliveMsg:
-			remote, ok := d.alive[msg.id]
+
 			select {
-			case remote <- true:
+			case d.alive[msg.id] <- true:
 			default:
+				gen, ok := d.handle[msg.id]
+				if !ok {
+					continue
+				}
 				remote := make(ping, 1)
 				d.alive[msg.id] = remote
-				go remote.wait(d.timeout, d.generator.New(msg.id, msg.address))
+				go remote.wait(d.timeout, gen.New(msg.ip))
 			}
 		}
 	}
 }
 
-func (d *discoverer) receiveBroadcasts() {
-	conn := d.conn
+func (d *discoverer) receiveBroadcasts(conn *net.UDPConn) {
 	buf := make([]byte, 65536)
 	for {
+
 		n, err := conn.Read(buf)
 		if err != nil {
 			return
 		}
 
 		// 44 is ','
-		elems := bytes.Split(buf[:n], byte(44))
-		if elems[0] != d.token {
+		elems := bytes.Split(buf[:n], []byte{44})
+		if !bytes.Equal(elems[0], d.token) {
 			continue
 		}
 
 		// pull the token off the front
 		elems = elems[1:]
 
-		for elem := range elems {
+		for _, elem := range elems {
 			// 64 is '@'
-			parts := bytes.SplitN(elem, byte(64), 2)
+			parts := bytes.SplitN(elem, []byte{64}, 2)
 			if len(parts) != 2 {
 				continue
 			}
 
 			packet := idip{
-				id: parts[0],
-				ip: parts[1],
+				id: string(parts[0]),
+				ip: string(parts[1]),
 			}
 
 			select {
@@ -167,9 +182,9 @@ func (d *discoverer) receiveBroadcasts() {
 }
 
 func (d *discoverer) makePacket() []byte {
-	buffer := bytes.NewBuffer(string(d.token))
+	buffer := bytes.NewBuffer(d.token)
 	for key, value := range d.broadcast {
-		buffer.Write(fmt.Sprintf(",%v@%v", key, value))
+		buffer.Write([]byte(fmt.Sprintf(",%v@%v", key, value)))
 	}
 
 	return buffer.Bytes()
